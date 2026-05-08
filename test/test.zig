@@ -7,15 +7,8 @@ const Arena = std.heap.ArenaAllocator;
 const Yaml = @import("yaml").Yaml;
 
 const gpa = testing.allocator;
-const io = testing.io;
-
 fn loadFromFile(file_path: []const u8) !Yaml {
-    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
-    defer file.close(io);
-    var buffer: [1024]u8 = undefined;
-    var reader = file.reader(io, &buffer);
-
-    const source = try reader.interface.allocRemaining(gpa, .unlimited);
+    const source = try std.fs.cwd().readFileAlloc(gpa, file_path, 1 << 20);
     defer gpa.free(source);
 
     var yaml: Yaml = .{ .source = source };

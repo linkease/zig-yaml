@@ -1,5 +1,4 @@
 const std = @import("std");
-const SpecTest = @import("test/spec.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -58,6 +57,7 @@ pub fn build(b: *std.Build) void {
 
     const enable_spec_tests = b.option(bool, "enable-spec-tests", "Enable YAML Test Suite") orelse false;
     if (enable_spec_tests) {
+        const SpecTest = @import("test/spec.zig");
         const gen = SpecTest.create(b);
         const spec_tests_module = b.addModule("spec", .{
             .root_source_file = gen.path(),

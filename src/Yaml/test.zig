@@ -189,6 +189,103 @@ test "simple flow sequence / bracket list with invalid comment" {
     try std.testing.expectError(error.ParseFailure, err);
 }
 
+test "mapping supports inline comments and quoted values" {
+    const source =
+        \\userToken: "file-token" # inline comment
+        \\routerIdx: 9 # comment
+        \\supplierCode: 'supplier:x'
+        \\featurePort: 18088 # comment
+        \\logPath: "stdout" # comment
+        \\bootConfigPath: "./custom/.ddnsto_boot.cfg" # comment
+        \\webdav:
+        \\  enabled: true # comment
+        \\  port: 18088
+        \\  username: "admin:user"
+        \\  password: 'sec#ret:1'
+        \\  diskPath: "/data path"
+    ;
+
+    const Config = struct {
+        userToken: []const u8,
+        routerIdx: u32,
+        supplierCode: []const u8,
+        featurePort: u16,
+        logPath: []const u8,
+        bootConfigPath: []const u8,
+        webdav: struct {
+            enabled: bool,
+            port: u16,
+            username: []const u8,
+            password: []const u8,
+            diskPath: []const u8,
+        },
+    };
+
+    var yaml: Yaml = .{ .source = source };
+    defer yaml.deinit(testing.allocator);
+    try yaml.load(testing.allocator);
+
+    var arena = Arena.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try yaml.parse(arena.allocator(), Config);
+
+    try testing.expectEqualStrings("file-token", parsed.userToken);
+    try testing.expectEqual(@as(u32, 9), parsed.routerIdx);
+    try testing.expectEqualStrings("supplier:x", parsed.supplierCode);
+    try testing.expectEqual(@as(u16, 18088), parsed.featurePort);
+    try testing.expectEqualStrings("stdout", parsed.logPath);
+    try testing.expectEqualStrings("./custom/.ddnsto_boot.cfg", parsed.bootConfigPath);
+    try testing.expect(parsed.webdav.enabled);
+    try testing.expectEqualStrings("admin:user", parsed.webdav.username);
+    try testing.expectEqualStrings("sec#ret:1", parsed.webdav.password);
+    try testing.expectEqualStrings("/data path", parsed.webdav.diskPath);
+}
+
+test "mapping supports anchor alias reuse" {
+    const source =
+        \\featurePort: 18088
+        \\webdavDefaults: &dav
+        \\  enabled: true
+        \\  port: 18088
+        \\  username: admin
+        \\  password: secret
+        \\  diskPath: /data
+        \\webdav: *dav
+    ;
+
+    const Config = struct {
+        featurePort: u16,
+        webdavDefaults: struct {
+            enabled: bool,
+            port: u16,
+            username: []const u8,
+            password: []const u8,
+            diskPath: []const u8,
+        },
+        webdav: struct {
+            enabled: bool,
+            port: u16,
+            username: []const u8,
+            password: []const u8,
+            diskPath: []const u8,
+        },
+    };
+
+    var yaml: Yaml = .{ .source = source };
+    defer yaml.deinit(testing.allocator);
+    try yaml.load(testing.allocator);
+
+    var arena = Arena.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try yaml.parse(arena.allocator(), Config);
+
+    try testing.expectEqual(@as(u16, 18088), parsed.featurePort);
+    try testing.expect(parsed.webdav.enabled);
+    try testing.expectEqualStrings("admin", parsed.webdav.username);
+    try testing.expectEqualStrings("secret", parsed.webdav.password);
+    try testing.expectEqualStrings("/data", parsed.webdav.diskPath);
+}
+
 test "simple flow sequence / bracket list with double trailing commas" {
     const source =
         \\a_key: [a, b, c,,]

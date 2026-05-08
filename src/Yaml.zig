@@ -33,7 +33,10 @@ pub fn deinit(self: *Yaml, gpa: Allocator) void {
 }
 
 pub fn load(self: *Yaml, gpa: Allocator) !void {
-    var parser = try Parser.init(gpa, self.source);
+    const normalized_source = try normalizeSource(gpa, self.source);
+    defer if (normalized_source.ptr != self.source.ptr) gpa.free(normalized_source);
+
+    var parser = try Parser.init(gpa, normalized_source);
     defer parser.deinit(gpa);
 
     parser.parse(gpa) catch |err| switch (err) {
@@ -52,6 +55,137 @@ pub fn load(self: *Yaml, gpa: Allocator) !void {
         const value = try Value.fromNode(gpa, self.tree.?, node);
         self.docs.appendAssumeCapacity(value);
     }
+}
+
+const AnchorDef = struct {
+    name: []const u8,
+    indent: usize,
+    child_lines: []const []const u8,
+};
+
+fn stripInlineComment(text: []const u8) []const u8 {
+    var in_single = false;
+    var in_double = false;
+    var escaped = false;
+    for (text, 0..) |ch, i| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        switch (ch) {
+            '\\' => {
+                if (in_double) escaped = true;
+            },
+            '\'' => {
+                if (!in_double) in_single = !in_single;
+            },
+            '"' => {
+                if (!in_single) in_double = !in_double;
+            },
+            '#' => if (!in_single and !in_double and (i == 0 or std.ascii.isWhitespace(text[i - 1]))) {
+                return std.mem.trimRight(u8, text[0..i], " \t\r\n");
+            },
+            else => {},
+        }
+    }
+    return std.mem.trimRight(u8, text, " \t\r\n");
+}
+
+fn lineIndent(line: []const u8) usize {
+    return line.len - std.mem.trimLeft(u8, line, " ").len;
+}
+
+fn parseAnchorDeclaration(line: []const u8) ?struct { name: []const u8, prefix: []const u8 } {
+    const idx = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    const value = std.mem.trim(u8, line[idx + 1 ..], " \t");
+    if (value.len < 2 or value[0] != '&') return null;
+    return .{
+        .name = value[1..],
+        .prefix = std.mem.trimRight(u8, line[0 .. idx + 1], " \t"),
+    };
+}
+
+fn parseAliasMapping(line: []const u8) ?struct { name: []const u8, prefix: []const u8, indent: usize } {
+    const idx = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    const value = std.mem.trim(u8, line[idx + 1 ..], " \t");
+    if (value.len < 2 or value[0] != '*') return null;
+    return .{
+        .name = value[1..],
+        .prefix = std.mem.trimRight(u8, line[0 .. idx + 1], " \t"),
+        .indent = lineIndent(line),
+    };
+}
+
+fn findAnchorDef(anchors: []const AnchorDef, name: []const u8) ?AnchorDef {
+    for (anchors) |anchor| {
+        if (std.mem.eql(u8, anchor.name, name)) return anchor;
+    }
+    return null;
+}
+
+fn normalizeSource(gpa: Allocator, source: []const u8) ![]const u8 {
+    var stripped_lines = std.ArrayList([]const u8).empty;
+    defer stripped_lines.deinit(gpa);
+
+    var split = std.mem.splitScalar(u8, source, '\n');
+    while (split.next()) |line_raw| {
+        const line = std.mem.trimRight(u8, line_raw, "\r");
+        try stripped_lines.append(gpa, stripInlineComment(line));
+    }
+
+    var anchors = std.ArrayList(AnchorDef).empty;
+    defer anchors.deinit(gpa);
+
+    for (stripped_lines.items, 0..) |line, i| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        const anchor = parseAnchorDeclaration(line) orelse continue;
+        const indent = lineIndent(line);
+        var end = i + 1;
+        while (end < stripped_lines.items.len) : (end += 1) {
+            const child = stripped_lines.items[end];
+            const child_trimmed = std.mem.trim(u8, child, " \t");
+            if (child_trimmed.len == 0) continue;
+            if (lineIndent(child) <= indent) break;
+        }
+        try anchors.append(gpa, .{
+            .name = anchor.name,
+            .indent = indent,
+            .child_lines = stripped_lines.items[i + 1 .. end],
+        });
+    }
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(gpa);
+    var writer = out.writer(gpa);
+    var changed = false;
+
+    for (stripped_lines.items) |line| {
+        if (!std.mem.eql(u8, line, std.mem.trimRight(u8, line, " \t\r\n"))) changed = true;
+        if (parseAnchorDeclaration(line)) |anchor| {
+            changed = true;
+            try writer.print("{s}\n", .{anchor.prefix});
+            continue;
+        }
+        if (parseAliasMapping(line)) |alias| {
+            if (findAnchorDef(anchors.items, alias.name)) |anchor| {
+                changed = true;
+                try writer.print("{s}\n", .{alias.prefix});
+                for (anchor.child_lines) |child| {
+                    const trimmed_child = std.mem.trimLeft(u8, child, " ");
+                    const new_indent = alias.indent + (lineIndent(child) - anchor.indent);
+                    try writer.writeByteNTimes(' ', new_indent);
+                    try writer.print("{s}\n", .{trimmed_child});
+                }
+                continue;
+            }
+        }
+        if (!std.mem.endsWith(u8, line, "\n")) changed = true;
+        try writer.print("{s}\n", .{line});
+    }
+
+    if (!changed) return source;
+    return try out.toOwnedSlice(gpa);
 }
 
 pub fn parse(self: Yaml, arena: Allocator, comptime T: type) Error!T {

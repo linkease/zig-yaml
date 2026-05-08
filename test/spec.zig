@@ -83,10 +83,9 @@ fn make(step: *Step, make_options: Step.MakeOptions) !void {
 
     const spec_test: *SpecTest = @fieldParentPtr("step", step);
     const b = step.owner;
-    const io = b.graph.io;
 
-    const cwd = std.Io.Dir.cwd();
-    cwd.access(io, "test/yaml-test-suite/tags", .{}) catch {
+    const cwd = std.fs.cwd();
+    cwd.access("test/yaml-test-suite/tags", .{}) catch {
         return spec_test.step.fail("Testfiles not found, make sure you have loaded the submodule.", .{});
     };
     if (b.graph.host.result.os.tag == .windows) {
@@ -104,31 +103,21 @@ fn make(step: *Step, make_options: Step.MakeOptions) !void {
         "test/yaml-test-suite",
     });
 
-    const root_data_dir = try std.Io.Dir.openDirAbsolute(io, root_data_path, .{});
+    const root_data_dir = try std.fs.openDirAbsolute(root_data_path, .{ .iterate = true });
 
-    var itdir = try root_data_dir.openDir(io, "tags", .{
+    var itdir = try root_data_dir.openDir("tags", .{
         .iterate = true,
-        .access_sub_paths = true,
     });
 
     var walker = try itdir.walk(arena);
     defer walker.deinit();
 
-    loop: {
-        while (walker.next(io)) |maybe_entry| {
-            if (maybe_entry) |entry| {
-                if (entry.kind != .sym_link) continue;
-                collectTest(io, arena, entry, &testcases) catch |err| switch (err) {
-                    error.OutOfMemory => @panic("OOM"),
-                    else => |e| return e,
-                };
-            } else {
-                break :loop;
-            }
-        } else |err| {
-            std.debug.print("err: {}", .{err});
-            break :loop;
-        }
+    while (try walker.next()) |entry| {
+        if (entry.kind != .sym_link) continue;
+        collectTest(arena, entry, &testcases) catch |err| switch (err) {
+            error.OutOfMemory => @panic("OOM"),
+            else => |e| return e,
+        };
     }
 
     var output_alloc = std.Io.Writer.Allocating.init(arena);
@@ -157,30 +146,28 @@ fn make(step: *Step, make_options: Step.MakeOptions) !void {
     const sub_path = b.pathJoin(&.{ &digest, test_filename });
     const sub_path_dirname = fs.path.dirname(sub_path).?;
 
-    b.cache_root.handle.createDirPath(io, sub_path_dirname) catch |err| {
+    b.cache_root.handle.makePath(sub_path_dirname) catch |err| {
         return step.fail("unable to make path '{?s}{s}': {any}", .{ b.cache_root.path, sub_path_dirname, err });
     };
 
-    b.cache_root.handle.writeFile(io, .{ .sub_path = sub_path, .data = output }) catch |err| {
+    b.cache_root.handle.writeFile(.{ .sub_path = sub_path, .data = output }) catch |err| {
         return step.fail("unable to write file: {}", .{err});
     };
     spec_test.output_file.path = try b.cache_root.join(b.allocator, &.{sub_path});
     try man.writeManifest();
 }
 
-fn collectTest(io: std.Io, arena: Allocator, entry: std.Io.Dir.Walker.Entry, testcases: *std.StringArrayHashMap(Testcase)) !void {
-    var path_components_it = std.fs.path.componentIterator(entry.path);
-    const first_path = path_components_it.first().?;
-
+fn collectTest(arena: Allocator, entry: std.fs.Dir.Walker.Entry, testcases: *std.StringArrayHashMap(Testcase)) !void {
+    var raw_components = std.mem.splitScalar(u8, entry.path, std.fs.path.sep);
+    const first_name = raw_components.next() orelse return;
     var path_components = std.array_list.Managed([]const u8).init(arena);
-    while (path_components_it.next()) |component| {
-        try path_components.append(component.name);
+    while (raw_components.next()) |component| {
+        if (component.len == 0) continue;
+        try path_components.append(component);
     }
 
     const remaining_path = try fs.path.join(arena, path_components.items);
     const result = try testcases.getOrPut(remaining_path);
-
-    var buffer: [256]u8 = undefined;
 
     if (!result.found_existing) {
         result.key_ptr.* = remaining_path;
@@ -189,19 +176,16 @@ fn collectTest(io: std.Io, arena: Allocator, entry: std.Io.Dir.Walker.Entry, tes
             entry.basename,
             "in.yaml",
         });
-        const real_in_path = try entry.dir.realPathFileAlloc(io, in_path, arena);
+        const real_in_path = try entry.dir.realpathAlloc(arena, in_path);
 
         const name_file_path = try fs.path.join(arena, &[_][]const u8{
             entry.basename,
             "===",
         });
-        const name_file = try entry.dir.openFile(io, name_file_path, .{});
-        defer name_file.close(io);
-        var reader = name_file.reader(io, &buffer);
-        const name = try reader.interface.allocRemaining(arena, .unlimited);
+        const name = try entry.dir.readFileAlloc(arena, name_file_path, 4096);
 
         var tag_set = std.BufSet.init(arena);
-        try tag_set.insert(first_path.name);
+        try tag_set.insert(first_name);
 
         const full_name = try std.fmt.allocPrint(arena, "{s} - {s}", .{
             remaining_path,
@@ -229,14 +213,14 @@ fn collectTest(io: std.Io, arena: Allocator, entry: std.Io.Dir.Walker.Entry, tes
             "error",
         });
 
-        if (canAccess(io, entry.dir, out_path)) {
-            const real_out_path = try entry.dir.realPathFileAlloc(io, out_path, arena);
+        if (canAccess(entry.dir, out_path)) {
+            const real_out_path = try entry.dir.realpathAlloc(arena, out_path);
             result.value_ptr.result = .{ .expected_output_path = real_out_path };
-        } else if (canAccess(io, entry.dir, err_path)) {
+        } else if (canAccess(entry.dir, err_path)) {
             result.value_ptr.result = .{ .error_expected = {} };
         }
     } else {
-        try result.value_ptr.tags.insert(first_path.name);
+        try result.value_ptr.tags.insert(first_name);
     }
 }
 
@@ -630,8 +614,8 @@ fn emitTest(output: *std.Io.Writer, testcase: Testcase) !void {
     try output.writeAll("}\n\n");
 }
 
-fn canAccess(io: std.Io, dir: std.Io.Dir, file_path: []const u8) bool {
-    if (dir.access(io, file_path, .{})) {
+fn canAccess(dir: std.fs.Dir, file_path: []const u8) bool {
+    if (dir.access(file_path, .{})) {
         return true;
     } else |_| {
         return false;
